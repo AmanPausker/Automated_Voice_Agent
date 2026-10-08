@@ -125,3 +125,38 @@ class VobizTelephonySerializer(FrameSerializer):
             pass
 
         return None
+
+
+class BrowserAudioSerializer(FrameSerializer):
+    """
+    Serializer for browser WebSocket audio streams.
+    Directly exchanges 16kHz linear PCM bytes with the browser Web Audio API.
+    """
+
+    async def serialize(self, frame: Frame) -> str | bytes | None:
+        if isinstance(frame, InterruptionFrame):
+            return json.dumps({"type": "interrupt"})
+
+        if isinstance(frame, OutputAudioRawFrame):
+            return frame.audio
+
+        return None
+
+    async def deserialize(self, data: str | bytes) -> Frame | None:
+        if isinstance(data, bytes):
+            return InputAudioRawFrame(
+                audio=data,
+                num_channels=1,
+                sample_rate=16000,
+            )
+
+        if isinstance(data, str):
+            try:
+                msg = json.loads(data)
+                if msg.get("type") in ("hangup", "stop", "close"):
+                    return EndFrame()
+            except Exception:
+                pass
+
+        return None
+

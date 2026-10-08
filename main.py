@@ -18,7 +18,7 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport,
     FastAPIWebsocketParams,
 )
-from src.utils.audio_helpers import VobizTelephonySerializer
+from src.utils.audio_helpers import VobizTelephonySerializer, BrowserAudioSerializer
 from src.agent.pipeline import create_agent_pipeline
 from src.tasks.cal_booking import get_available_slots, book_appointment, list_event_types
 from db.database import get_db_connection, save_call_end
@@ -141,6 +141,24 @@ async def dashboard():
             <div class="badge"><span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#10b981;"></span> Engine Online</div>
         </header>
 
+        <!-- Live Web Audio Tester -->
+        <div class="card" style="border: 1px solid rgba(99, 102, 241, 0.4); background: radial-gradient(circle at 50% 0%, rgba(99, 102, 241, 0.12) 0%, var(--card-bg) 80%); margin-bottom: 2rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem;">
+                <div>
+                    <h2>🎙️ Test Agent Live in Browser (Zero Cost)</h2>
+                    <p style="color: var(--text-muted); font-size: 0.9rem; margin-top: 0.2rem;">
+                        Test Jacqueline, Deepgram, OpenRouter, and Cal.com booking directly with your computer's mic and speakers!
+                    </p>
+                </div>
+                <div style="display: flex; align-items: center; gap: 1rem;">
+                    <button id="call-btn" onclick="toggleBrowserCall()" style="background: #10b981; padding: 0.75rem 1.6rem; font-size: 1rem; border-radius: 0.6rem; font-weight: 600; display: flex; align-items: center; gap: 0.5rem; box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3);">
+                        <span>📞</span> <span id="call-btn-text">Call Jacqueline</span>
+                    </button>
+                    <span id="call-status" style="font-size: 0.85rem; color: var(--text-muted);">Ready to test</span>
+                </div>
+            </div>
+        </div>
+
         <div class="grid">
             <!-- Integration Status -->
             <div class="card">
@@ -204,6 +222,163 @@ async def dashboard():
         const host = window.location.host;
         document.getElementById('webhook-url').innerText = `https://${host}/vobiz/inbound`;
         document.getElementById('ws-url').innerText = `wss://${host}/ws/vobiz-stream`;
+
+        let callWs = null;
+        let audioCtx = null;
+        let micStream = null;
+        let micProcessor = null;
+        let isCalling = false;
+        let nextPlayTime = 0;
+        let activeSources = [];
+
+        async function toggleBrowserCall() {
+            if (isCalling) {
+                endBrowserCall();
+            } else {
+                startBrowserCall();
+            }
+        }
+
+        async function startBrowserCall() {
+            const btn = document.getElementById('call-btn');
+            const btnText = document.getElementById('call-btn-text');
+            const status = document.getElementById('call-status');
+
+            status.innerText = 'Connecting mic & audio...';
+            btn.style.opacity = '0.7';
+
+            try {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                micStream = await navigator.mediaDevices.getUserMedia({
+                    audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+                });
+
+                const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                callWs = new WebSocket(`${wsProto}//${host}/ws/browser-call`);
+                callWs.binaryType = 'arraybuffer';
+
+                callWs.onopen = () => {
+                    isCalling = true;
+                    btnText.innerText = 'End Call';
+                    btn.style.background = '#ef4444';
+                    btn.style.boxShadow = '0 4px 15px rgba(239, 68, 68, 0.4)';
+                    btn.style.opacity = '1';
+                    status.innerHTML = '<span style="color: #34d399;">🟢 In Call — Jacqueline is speaking...</span>';
+
+                    // Stream microphone to WebSocket
+                    const source = audioCtx.createMediaStreamSource(micStream);
+                    micProcessor = audioCtx.createScriptProcessor(2048, 1, 1);
+                    source.connect(micProcessor);
+                    micProcessor.connect(audioCtx.destination);
+
+                    micProcessor.onaudioprocess = (e) => {
+                        if (!isCalling || !callWs || callWs.readyState !== WebSocket.OPEN) return;
+                        const input = e.inputBuffer.getChannelData(0);
+                        const pcm = new Int16Array(input.length);
+                        for (let i = 0; i < input.length; i++) {
+                            const s = Math.max(-1, Math.min(1, input[i]));
+                            pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                        }
+                        callWs.send(pcm.buffer);
+                    };
+                };
+
+                callWs.onmessage = async (e) => {
+                    if (typeof e.data === 'string') {
+                        try {
+                            const msg = JSON.parse(e.data);
+                            if (msg.type === 'interrupt') {
+                                stopAllPlayback();
+                            }
+                        } catch(err) {}
+                        return;
+                    }
+
+                    // Received binary PCM from Cartesia
+                    const pcm16 = new Int16Array(e.data);
+                    const float32 = new Float32Array(pcm16.length);
+                    for (let i = 0; i < pcm16.length; i++) {
+                        float32[i] = pcm16[i] / 32768.0;
+                    }
+
+                    playAudioChunk(float32);
+                };
+
+                callWs.onclose = () => {
+                    endBrowserCall();
+                };
+
+                callWs.onerror = () => {
+                    endBrowserCall();
+                };
+
+            } catch (err) {
+                console.error(err);
+                alert('Microphone access denied or audio error: ' + err.message);
+                endBrowserCall();
+            }
+        }
+
+        function playAudioChunk(samples) {
+            if (!audioCtx) return;
+            const audioBuffer = audioCtx.createBuffer(1, samples.length, 16000);
+            audioBuffer.getChannelData(0).set(samples);
+            const source = audioCtx.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(audioCtx.destination);
+
+            const now = audioCtx.currentTime;
+            if (nextPlayTime < now) {
+                nextPlayTime = now;
+            }
+            source.start(nextPlayTime);
+            nextPlayTime += audioBuffer.duration;
+            activeSources.push(source);
+            source.onended = () => {
+                const idx = activeSources.indexOf(source);
+                if (idx > -1) activeSources.splice(idx, 1);
+            };
+        }
+
+        function stopAllPlayback() {
+            activeSources.forEach(s => {
+                try { s.stop(); } catch(e) {}
+            });
+            activeSources = [];
+            if (audioCtx) nextPlayTime = audioCtx.currentTime;
+        }
+
+        function endBrowserCall() {
+            isCalling = false;
+            stopAllPlayback();
+
+            if (micStream) {
+                micStream.getTracks().forEach(t => t.stop());
+                micStream = null;
+            }
+            if (micProcessor) {
+                micProcessor.disconnect();
+                micProcessor = null;
+            }
+            if (callWs) {
+                try { callWs.close(); } catch(e) {}
+                callWs = null;
+            }
+            if (audioCtx) {
+                try { audioCtx.close(); } catch(e) {}
+                audioCtx = null;
+            }
+
+            const btn = document.getElementById('call-btn');
+            const btnText = document.getElementById('call-btn-text');
+            const status = document.getElementById('call-status');
+
+            btnText.innerText = 'Call Jacqueline';
+            btn.style.background = '#10b981';
+            btn.style.boxShadow = '0 4px 15px rgba(16, 185, 129, 0.3)';
+            btn.style.opacity = '1';
+            status.innerText = 'Call ended. Ready to test again.';
+        }
 
         async function fetchStatus() {
             try {
@@ -371,6 +546,46 @@ async def vobiz_websocket_stream(
     finally:
         save_call_end(call_id=call_session_id, transcript="Call ended", status="completed")
         logger.info(f"Cleaned up call session {call_session_id}")
+
+
+@app.websocket("/ws/browser-call")
+async def browser_websocket_stream(websocket: WebSocket):
+    """
+    Direct Web Audio WebSocket stream for instant testing from the browser dashboard.
+    """
+    await websocket.accept()
+    call_session_id = f"browser-{uuid.uuid4().hex[:8]}"
+    logger.info(f"Browser testing call connected: {call_session_id}")
+
+    serializer = BrowserAudioSerializer()
+    transport = FastAPIWebsocketTransport(
+        websocket=websocket,
+        params=FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            audio_in_sample_rate=16000,
+            audio_out_sample_rate=16000,
+            serializer=serializer,
+        ),
+    )
+
+    task, runner, trigger_greeting = create_agent_pipeline(
+        transport=transport,
+        call_id=call_session_id,
+        caller_phone="+91-Browser-User",
+    )
+
+    try:
+        runner_task = asyncio.create_task(runner.run(task))
+        await trigger_greeting()
+        await runner_task
+    except WebSocketDisconnect:
+        logger.info(f"Browser call disconnected: {call_session_id}")
+    except Exception as e:
+        logger.error(f"Error during browser call: {e}")
+    finally:
+        save_call_end(call_id=call_session_id, transcript="Browser test completed", status="completed")
+        logger.info(f"Cleaned up browser call {call_session_id}")
 
 
 if __name__ == "__main__":
