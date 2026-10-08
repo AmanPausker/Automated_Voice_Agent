@@ -63,19 +63,13 @@ def create_agent_pipeline(
         )
     )
 
-    # 3. STT (Speech-to-Text: Deepgram with sub-second endpointing)
+    # 3. STT (Speech-to-Text: Deepgram)
     deepgram_key = os.getenv("DEEPGRAM_API_KEY", "").strip().strip('"')
     if not deepgram_key:
         logger.warning("DEEPGRAM_API_KEY is not set. Please add it to your .env file.")
     stt = DeepgramSTTService(
         api_key=deepgram_key,
-        settings=DeepgramSTTService.Settings(
-            model="nova-2-general",
-            interim_results=True,
-            smart_format=True,
-            endpointing=150,
-            utterance_end_ms=800,
-        ),
+        encoding="linear16",
         sample_rate=16000,
     )
 
@@ -215,7 +209,6 @@ def create_agent_pipeline(
 
     # 8. Conversation Context & Aggregators (Tuned for ultra-low 350ms turn latency)
     context = LLMContext(
-        messages=[{"role": "system", "content": system_prompt}],
         tools=[check_slots_schema, book_appt_schema],
     )
     user_params = LLMUserAggregatorParams(

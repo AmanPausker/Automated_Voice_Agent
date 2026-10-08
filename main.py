@@ -263,21 +263,37 @@ async def dashboard():
                     btn.style.background = '#ef4444';
                     btn.style.boxShadow = '0 4px 15px rgba(239, 68, 68, 0.4)';
                     btn.style.opacity = '1';
-                    status.innerHTML = '<span style="color: #34d399;">🟢 In Call — Jacqueline is speaking...</span>';
+                    status.innerHTML = '<span style="color: #34d399;">🟢 In Call</span> &bull; <span id="mic-indicator" style="color: #a5b4fc;">Mic ready</span>';
 
-                    // Stream microphone to WebSocket
+                    // Stream microphone to WebSocket without speaker feedback
                     const source = audioCtx.createMediaStreamSource(micStream);
                     micProcessor = audioCtx.createScriptProcessor(2048, 1, 1);
+                    const silentGain = audioCtx.createGain();
+                    silentGain.gain.value = 0;
                     source.connect(micProcessor);
-                    micProcessor.connect(audioCtx.destination);
+                    micProcessor.connect(silentGain);
+                    silentGain.connect(audioCtx.destination);
 
                     micProcessor.onaudioprocess = (e) => {
                         if (!isCalling || !callWs || callWs.readyState !== WebSocket.OPEN) return;
                         const input = e.inputBuffer.getChannelData(0);
                         const pcm = new Int16Array(input.length);
+                        let sum = 0;
                         for (let i = 0; i < input.length; i++) {
                             const s = Math.max(-1, Math.min(1, input[i]));
                             pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                            sum += s * s;
+                        }
+                        const rms = Math.sqrt(sum / input.length);
+                        const indicator = document.getElementById('mic-indicator');
+                        if (indicator) {
+                            if (rms > 0.02) {
+                                indicator.innerText = '🎙️ Speaking...';
+                                indicator.style.color = '#34d399';
+                            } else {
+                                indicator.innerText = 'Listening...';
+                                indicator.style.color = '#9ca3af';
+                            }
                         }
                         callWs.send(pcm.buffer);
                     };
