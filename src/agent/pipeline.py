@@ -9,12 +9,18 @@ from loguru import logger
 from dotenv import load_dotenv
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.processors.audio.vad_processor import VADProcessor
+from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import SpeechTimeoutUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import FunctionSchema, LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
 from pipecat.frames.frames import LLMMessagesAppendFrame
 
 from pipecat.services.openai.llm import OpenAILLMService
@@ -46,16 +52,30 @@ def create_agent_pipeline(
     caller_name = profile.get("name", "")
     system_prompt = get_system_prompt(caller_name=caller_name, caller_phone=caller_phone)
 
-    # 2. VAD (Voice Activity Detection for low-latency interruptions)
-    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer())
+    # 2. VAD (Voice Activity Detection with tuned low-latency silence threshold)
+    vad = VADProcessor(
+        vad_analyzer=SileroVADAnalyzer(
+            params=VADParams(
+                start_secs=0.08,
+                stop_secs=0.25,
+                confidence=0.7,
+            )
+        )
+    )
 
-    # 3. STT (Speech-to-Text: Deepgram)
+    # 3. STT (Speech-to-Text: Deepgram with sub-second endpointing)
     deepgram_key = os.getenv("DEEPGRAM_API_KEY", "").strip().strip('"')
     if not deepgram_key:
         logger.warning("DEEPGRAM_API_KEY is not set. Please add it to your .env file.")
     stt = DeepgramSTTService(
         api_key=deepgram_key,
-        encoding="linear16",
+        settings=DeepgramSTTService.Settings(
+            model="nova-2-general",
+            interim_results=True,
+            smart_format=True,
+            endpointing=150,
+            utterance_end_ms=800,
+        ),
         sample_rate=16000,
     )
 
@@ -69,19 +89,34 @@ def create_agent_pipeline(
         llm = OpenAILLMService(
             api_key=openrouter_key,
             base_url="https://openrouter.ai/api/v1",
-            settings=OpenAILLMService.Settings(model=llm_model),
+            settings=OpenAILLMService.Settings(
+                model=llm_model,
+                system_instruction=system_prompt,
+                max_tokens=120,
+                temperature=0.7,
+            ),
         )
     elif openai_key:
         logger.info("Using native OpenAI gpt-4o-mini")
         llm = OpenAILLMService(
             api_key=openai_key,
-            settings=OpenAILLMService.Settings(model="gpt-4o-mini"),
+            settings=OpenAILLMService.Settings(
+                model="gpt-4o-mini",
+                system_instruction=system_prompt,
+                max_tokens=120,
+                temperature=0.7,
+            ),
         )
     else:
         logger.warning("Neither OPEN_ROUTER_API_KEY nor OPENAI_API_KEY is set in .env")
         llm = OpenAILLMService(
             api_key="sk-placeholder",
-            settings=OpenAILLMService.Settings(model="gpt-4o-mini"),
+            settings=OpenAILLMService.Settings(
+                model="gpt-4o-mini",
+                system_instruction=system_prompt,
+                max_tokens=120,
+                temperature=0.7,
+            ),
         )
 
     # 5. Define Tool Schemas
@@ -178,12 +213,17 @@ def create_agent_pipeline(
             sample_rate=16000,
         )
 
-    # 8. Conversation Context & Aggregators
+    # 8. Conversation Context & Aggregators (Tuned for ultra-low 350ms turn latency)
     context = LLMContext(
         messages=[{"role": "system", "content": system_prompt}],
         tools=[check_slots_schema, book_appt_schema],
     )
-    context_aggregator = LLMContextAggregatorPair(context)
+    user_params = LLMUserAggregatorParams(
+        user_turn_strategies=UserTurnStrategies(
+            stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.35, wait_for_transcript=True)]
+        )
+    )
+    context_aggregator = LLMContextAggregatorPair(context, user_params=user_params)
 
     # 9. Assembly
     pipeline = Pipeline([

@@ -118,10 +118,16 @@ async def book_appointment(
         },
     }
 
+    headers = {
+        "Authorization": f"Bearer {CAL_API_KEY.strip()}",
+        "cal-api-version": "2024-08-13",
+        "Content-Type": "application/json",
+    }
+
     async with httpx.AsyncClient() as client:
         res = await client.post(
             f"{BASE_URL}/bookings",
-            headers=_get_headers(),
+            headers=headers,
             json=payload,
         )
 
