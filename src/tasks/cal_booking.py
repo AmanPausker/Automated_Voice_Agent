@@ -8,6 +8,7 @@ from typing import Dict, Any, List, Optional
 import httpx
 from dotenv import load_dotenv
 from db.database import save_booking
+from src.utils.whatsapp import send_booking_confirmation_whatsapp
 
 load_dotenv()
 
@@ -144,6 +145,15 @@ async def book_appointment(
                 start_time=start_time,
                 notes=notes,
             )
+
+            # Send WhatsApp confirmation to the caller
+            if phone:
+                await send_booking_confirmation_whatsapp(
+                    to_phone=phone,
+                    guest_name=name,
+                    start_time=start_time,
+                    booking_id=booking_id,
+                )
 
             return {
                 "success": True,
