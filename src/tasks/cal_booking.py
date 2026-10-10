@@ -7,8 +7,13 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 import httpx
 from dotenv import load_dotenv
-from db.database import save_booking
-from src.utils.whatsapp import send_booking_confirmation_whatsapp
+from db.database import has_queued_booking_notification, save_booking
+from src.utils.whatsapp import (
+    WHATSAPP_TENANT_ID,
+    build_booking_template,
+    is_valid_e164_phone,
+)
+from loguru import logger
 
 load_dotenv()
 
@@ -135,8 +140,24 @@ async def book_appointment(
         if res.status_code in (200, 201):
             booking_data = res.json().get("data", {})
             booking_id = str(booking_data.get("id", ""))
-            
-            # Persist in local DB
+            template = None
+            if phone and booking_id and is_valid_e164_phone(phone):
+                try:
+                    template = build_booking_template(name, start_time, booking_id)
+                except ValueError as exc:
+                    logger.error(
+                        "WhatsApp notification could not be prepared for booking {}: {}",
+                        booking_id,
+                        exc,
+                    )
+            elif phone and not is_valid_e164_phone(phone):
+                logger.warning(
+                    "WhatsApp notification was not queued for booking {} because its "
+                    "recipient number is not valid E.164",
+                    booking_id,
+                )
+
+            # Persist the appointment and opted-in notification event atomically.
             save_booking(
                 call_id=call_id,
                 cal_booking_id=booking_id,
@@ -144,21 +165,20 @@ async def book_appointment(
                 guest_email=email,
                 start_time=start_time,
                 notes=notes,
+                phone_number=phone,
+                tenant_id=WHATSAPP_TENANT_ID,
+                notification_template=template,
             )
-
-            # Send WhatsApp confirmation to the caller
-            if phone:
-                await send_booking_confirmation_whatsapp(
-                    to_phone=phone,
-                    guest_name=name,
-                    start_time=start_time,
-                    booking_id=booking_id,
-                )
+            notification_queued = bool(
+                booking_id
+                and has_queued_booking_notification(WHATSAPP_TENANT_ID, booking_id)
+            )
 
             return {
                 "success": True,
                 "booking_id": booking_id,
                 "start": start_time,
+                "whatsapp_notification": "queued" if notification_queued else "not_enabled",
                 "message": f"Appointment booked successfully for {name} at {start_time}",
             }
         else:

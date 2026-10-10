@@ -32,7 +32,11 @@ from pipecat.services.llm_service import FunctionCallParams
 from src.agent.prompts import get_system_prompt
 from src.tasks.cal_booking import get_available_slots, book_appointment
 from src.user.user_service import get_caller_profile
-from db.database import save_call_start, save_call_end
+from db.database import save_call_start, save_call_end, set_whatsapp_preference
+from src.utils.whatsapp import (
+    WHATSAPP_TENANT_ID,
+    is_valid_e164_phone,
+)
 
 load_dotenv()
 
@@ -150,6 +154,24 @@ def create_agent_pipeline(
         required=["start_time", "name", "email"],
     )
 
+    whatsapp_preferences_schema = FunctionSchema(
+        name="manage_whatsapp_notifications",
+        description=(
+            "Record the caller's explicit choice to enable or disable appointment "
+            "confirmation messages on their WhatsApp number."
+        ),
+        properties={
+            "enabled": {
+                "type": "boolean",
+                "description": (
+                    "True only after the caller explicitly agrees; false when they "
+                    "decline or request that WhatsApp notifications be stopped."
+                ),
+            }
+        },
+        required=["enabled"],
+    )
+
     # 6. Register Tool Handlers
     async def handle_check_slots(params: FunctionCallParams):
         date_str = params.arguments.get("date", "")
@@ -187,8 +209,46 @@ def create_agent_pipeline(
         )
         await params.result_callback(result)
 
+    async def handle_whatsapp_preferences(params: FunctionCallParams):
+        enabled = params.arguments.get("enabled")
+        if not isinstance(enabled, bool):
+            await params.result_callback(
+                {"success": False, "message": "A clear enable or disable choice is required."}
+            )
+            return
+        if not is_valid_e164_phone(caller_phone):
+            await params.result_callback(
+                {
+                    "success": False,
+                    "message": (
+                        "The caller ID is not a valid international phone number. "
+                        "Do not enable WhatsApp notifications."
+                    ),
+                }
+            )
+            return
+        set_whatsapp_preference(
+            tenant_id=WHATSAPP_TENANT_ID,
+            phone_number=caller_phone,
+            enabled=enabled,
+            consent_source="voice_call",
+            consent_text_version="whatsapp-consent-v1",
+        )
+        await params.result_callback(
+            {
+                "success": True,
+                "enabled": enabled,
+                "message": (
+                    "WhatsApp notifications are enabled."
+                    if enabled
+                    else "WhatsApp notifications are disabled."
+                ),
+            }
+        )
+
     llm.register_function("check_available_slots", handle_check_slots)
     llm.register_function("book_appointment", handle_book_appt)
+    llm.register_function("manage_whatsapp_notifications", handle_whatsapp_preferences)
 
     # 7. TTS (Text-to-Speech: Cartesia or OpenAI)
     cartesia_key = os.getenv("CARTESIA_API_KEY", "").strip().strip('"')
@@ -209,7 +269,7 @@ def create_agent_pipeline(
 
     # 8. Conversation Context & Aggregators (Tuned for ultra-low 350ms turn latency)
     context = LLMContext(
-        tools=[check_slots_schema, book_appt_schema],
+        tools=[check_slots_schema, book_appt_schema, whatsapp_preferences_schema],
     )
     user_params = LLMUserAggregatorParams(
         user_turn_strategies=UserTurnStrategies(

@@ -7,9 +7,11 @@ import os
 import json
 import uuid
 import asyncio
+import hmac
+from contextlib import asynccontextmanager
 from typing import Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Query, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 from dotenv import load_dotenv
@@ -22,13 +24,48 @@ from src.utils.audio_helpers import VobizTelephonySerializer, BrowserAudioSerial
 from src.agent.pipeline import create_agent_pipeline
 from src.tasks.cal_booking import get_available_slots, book_appointment, list_event_types
 from db.database import get_db_connection, save_call_end
+from src.utils.whatsapp import (
+    WHATSAPP_ACCESS_TOKEN,
+    WHATSAPP_PHONE_NUMBER_ID,
+    WHATSAPP_VERIFY_TOKEN,
+    log_whatsapp_configuration,
+    process_notification_queue,
+    process_delivery_webhook,
+    verify_webhook_signature,
+)
 
 load_dotenv()
+
+async def _notification_worker() -> None:
+    while True:
+        try:
+            await process_notification_queue()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("WhatsApp notification queue processing failed")
+        await asyncio.sleep(5)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    log_whatsapp_configuration()
+    worker = asyncio.create_task(_notification_worker())
+    try:
+        yield
+    finally:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+
 
 app = FastAPI(
     title="Automated Voice Receptionist",
     description="Pipecat + Vobiz + Cal.com AI Voice Agent Backend",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -48,6 +85,7 @@ async def root():
         "service": "Automated Voice Agent",
         "integrations": {
             "cal_com": bool(os.getenv("CAL.COM_API_KEY") or os.getenv("CAL_COM_API_KEY")),
+            "whatsapp": bool(WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID),
             "deepgram": bool(os.getenv("DEEPGRAM_API_KEY")),
             "llm": bool(os.getenv("OPEN_ROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")),
             "llm_provider": "OpenRouter (gpt-4o-mini)" if (os.getenv("OPEN_ROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY")) else ("OpenAI" if os.getenv("OPENAI_API_KEY") else "None"),
@@ -59,6 +97,7 @@ async def root():
             "vobiz_audio_stream_ws": "/ws/vobiz-stream",
             "cal_slots": "/cal/slots?date=YYYY-MM-DD",
             "call_logs": "/calls",
+            "whatsapp_webhook": "/webhooks/whatsapp",
         },
     }
 
@@ -471,6 +510,36 @@ async def book_slot(request: Request):
         notes=data.get("notes", ""),
     )
     return result
+
+
+@app.get("/webhooks/whatsapp")
+async def verify_whatsapp_webhook(
+    mode: Optional[str] = Query(None, alias="hub.mode"),
+    verify_token: Optional[str] = Query(None, alias="hub.verify_token"),
+    challenge: Optional[str] = Query(None, alias="hub.challenge"),
+):
+    if not WHATSAPP_VERIFY_TOKEN or not mode or not verify_token or not challenge:
+        raise HTTPException(status_code=503, detail="WhatsApp webhook verification is not configured")
+    if mode != "subscribe" or not hmac.compare_digest(verify_token, WHATSAPP_VERIFY_TOKEN):
+        raise HTTPException(status_code=403, detail="Webhook verification failed")
+    return PlainTextResponse(challenge)
+
+
+@app.post("/webhooks/whatsapp")
+async def receive_whatsapp_webhook(request: Request):
+    raw_body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    if not verify_webhook_signature(raw_body, signature):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    try:
+        payload = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid webhook payload") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid webhook payload")
+
+    process_delivery_webhook(payload)
+    return JSONResponse({"status": "ok"})
 
 
 # ==========================================
