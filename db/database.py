@@ -120,6 +120,106 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_notification_appointment
             ON notification_outbox (tenant_id, appointment_id);
         """)
+
+        # Google Calendar per-doctor tables
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS doctors (
+                doctor_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL,
+                encrypted_refresh_token TEXT,
+                calendar_id TEXT DEFAULT 'primary',
+                color_id TEXT DEFAULT '2',
+                slot_duration_minutes INTEGER DEFAULT 15,
+                timezone TEXT DEFAULT 'Asia/Kolkata',
+                specialty TEXT,
+                status TEXT DEFAULT 'active' CHECK (status IN ('active', 'needs_reconnect')),
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS clinic_config (
+                tenant_id TEXT NOT NULL,
+                doctor_id TEXT NOT NULL DEFAULT '',
+                working_days TEXT NOT NULL DEFAULT '[1,2,3,4,5,6]',
+                open_time TEXT NOT NULL DEFAULT '09:00',
+                close_time TEXT NOT NULL DEFAULT '18:00',
+                break_windows TEXT NOT NULL DEFAULT '[{"start":"13:00","end":"14:00"}]',
+                holidays TEXT NOT NULL DEFAULT '[]',
+                timezone TEXT NOT NULL DEFAULT 'Asia/Kolkata',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (tenant_id, doctor_id)
+            );
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS doctor_slots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                doctor_id TEXT NOT NULL,
+                slot_start TEXT NOT NULL,
+                slot_end TEXT NOT NULL,
+                google_event_id TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('seeded', 'removed', 'booked')),
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (doctor_id, slot_start)
+            );
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_doctor_slots_lookup
+            ON doctor_slots (doctor_id, slot_start);
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS calendar_sync_state (
+                doctor_id TEXT PRIMARY KEY,
+                sync_token TEXT,
+                channel_id TEXT,
+                resource_id TEXT,
+                channel_expiration TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS appointments (
+                appointment_id TEXT PRIMARY KEY,
+                doctor_id TEXT NOT NULL,
+                google_event_id TEXT NOT NULL,
+                patient_name TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                reason TEXT,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'booked' CHECK (status IN ('booked', 'cancelled', 'rescheduled')),
+                call_id TEXT,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (doctor_id) REFERENCES doctors (doctor_id)
+            );
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_appointments_doctor
+            ON appointments (doctor_id, start_time);
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_appointments_phone
+            ON appointments (phone);
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                entity_id TEXT,
+                doctor_id TEXT,
+                details TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
         conn.commit()
 
 
@@ -411,6 +511,457 @@ def get_call(call_id: str) -> Optional[Dict[str, Any]]:
         cursor.execute("SELECT * FROM calls WHERE call_id = ?", (call_id,))
         row = cursor.fetchone()
         return dict(row) if row else None
+
+
+# ---------------------------------------------------------
+# Google Calendar Scheduling Accessors & Multi-Doctor Logic
+# ---------------------------------------------------------
+
+def upsert_doctor(doctor_data: Dict[str, Any]) -> None:
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO doctors (
+                doctor_id, name, email, encrypted_refresh_token, calendar_id,
+                color_id, slot_duration_minutes, timezone, specialty, status,
+                tenant_id, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (doctor_id) DO UPDATE SET
+                name = excluded.name,
+                email = excluded.email,
+                encrypted_refresh_token = COALESCE(excluded.encrypted_refresh_token, doctors.encrypted_refresh_token),
+                calendar_id = excluded.calendar_id,
+                color_id = excluded.color_id,
+                slot_duration_minutes = excluded.slot_duration_minutes,
+                timezone = excluded.timezone,
+                specialty = excluded.specialty,
+                status = excluded.status,
+                tenant_id = excluded.tenant_id,
+                updated_at = excluded.updated_at
+            """,
+            (
+                doctor_data["doctor_id"],
+                doctor_data.get("name", "Dr. Unknown"),
+                doctor_data.get("email", ""),
+                doctor_data.get("encrypted_refresh_token"),
+                doctor_data.get("calendar_id", "primary"),
+                doctor_data.get("color_id", "2"),
+                doctor_data.get("slot_duration_minutes", 15),
+                doctor_data.get("timezone", os.getenv("CLINIC_TIMEZONE", "Asia/Kolkata")),
+                doctor_data.get("specialty", "General Medicine"),
+                doctor_data.get("status", "active"),
+                doctor_data.get("tenant_id", "default"),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+
+
+def get_doctor(doctor_id: str) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM doctors WHERE doctor_id = ?", (doctor_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_doctors(tenant_id: Optional[str] = None, specialty: Optional[str] = None) -> list[Dict[str, Any]]:
+    query = "SELECT * FROM doctors WHERE 1=1"
+    params: list[Any] = []
+    if tenant_id:
+        query += " AND tenant_id = ?"
+        params.append(tenant_id)
+    if specialty:
+        query += " AND LOWER(specialty) = LOWER(?)"
+        params.append(specialty)
+    query += " ORDER BY name ASC"
+    with get_db_connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def set_doctor_status(doctor_id: str, status: str) -> None:
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    with get_db_connection() as conn:
+        conn.execute(
+            "UPDATE doctors SET status = ?, updated_at = ? WHERE doctor_id = ?",
+            (status, now, doctor_id),
+        )
+        conn.commit()
+
+
+def save_sync_state(
+    doctor_id: str,
+    sync_token: Optional[str] = None,
+    channel_id: Optional[str] = None,
+    resource_id: Optional[str] = None,
+    channel_expiration: Optional[str] = None,
+) -> None:
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO calendar_sync_state (
+                doctor_id, sync_token, channel_id, resource_id, channel_expiration, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (doctor_id) DO UPDATE SET
+                sync_token = COALESCE(excluded.sync_token, calendar_sync_state.sync_token),
+                channel_id = COALESCE(excluded.channel_id, calendar_sync_state.channel_id),
+                resource_id = COALESCE(excluded.resource_id, calendar_sync_state.resource_id),
+                channel_expiration = COALESCE(excluded.channel_expiration, calendar_sync_state.channel_expiration),
+                updated_at = excluded.updated_at
+            """,
+            (doctor_id, sync_token, channel_id, resource_id, channel_expiration, now),
+        )
+        conn.commit()
+
+
+def get_sync_state(doctor_id: str) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM calendar_sync_state WHERE doctor_id = ?", (doctor_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def record_slot_state(
+    doctor_id: str,
+    slot_start: str,
+    slot_end: str,
+    google_event_id: str,
+    state: str,
+) -> None:
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO doctor_slots (
+                doctor_id, slot_start, slot_end, google_event_id, state, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (doctor_id, slot_start) DO UPDATE SET
+                slot_end = excluded.slot_end,
+                google_event_id = excluded.google_event_id,
+                state = excluded.state,
+                updated_at = excluded.updated_at
+            """,
+            (doctor_id, slot_start, slot_end, google_event_id, state, now),
+        )
+        conn.commit()
+
+
+def get_slot_state(doctor_id: str, slot_start: str) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM doctor_slots WHERE doctor_id = ? AND slot_start = ?",
+            (doctor_id, slot_start),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_doctor_slots(
+    doctor_id: str,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+) -> list[Dict[str, Any]]:
+    query = "SELECT * FROM doctor_slots WHERE doctor_id = ?"
+    params: list[Any] = [doctor_id]
+    if start_time:
+        query += " AND slot_start >= ?"
+        params.append(start_time)
+    if end_time:
+        query += " AND slot_start <= ?"
+        params.append(end_time)
+    query += " ORDER BY slot_start ASC"
+    with get_db_connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def save_appointment(
+    appointment_data: Dict[str, Any],
+    notification_template: Optional[Dict[str, Any]] = None,
+) -> None:
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    appointment_id = appointment_data["appointment_id"]
+    tenant_id = appointment_data.get("tenant_id", "default")
+    phone = appointment_data.get("phone", "")
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO appointments (
+                appointment_id, doctor_id, google_event_id, patient_name,
+                phone, reason, start_time, end_time, status, call_id,
+                tenant_id, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                appointment_id,
+                appointment_data["doctor_id"],
+                appointment_data["google_event_id"],
+                appointment_data["patient_name"],
+                phone,
+                appointment_data.get("reason", ""),
+                appointment_data["start_time"],
+                appointment_data["end_time"],
+                appointment_data.get("status", "booked"),
+                appointment_data.get("call_id"),
+                tenant_id,
+                now,
+                now,
+            ),
+        )
+
+        preference = None
+        if phone:
+            preference = conn.execute(
+                """
+                SELECT enabled FROM whatsapp_preferences
+                WHERE tenant_id = ? AND phone_number = ?
+                """,
+                (tenant_id, phone),
+            ).fetchone()
+
+        if (
+            preference
+            and preference["enabled"]
+            and notification_template
+            and appointment_id
+        ):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO notification_outbox (
+                    notification_id, tenant_id, appointment_id, patient_id,
+                    event_type, recipient_phone, template_name,
+                    template_language, template_parameters
+                )
+                VALUES (?, ?, ?, ?, 'BOOKED', ?, ?, ?, ?)
+                """,
+                (
+                    f"{tenant_id}:BOOKED:{appointment_id}",
+                    tenant_id,
+                    appointment_id,
+                    appointment_data.get("call_id"),
+                    phone,
+                    notification_template["name"],
+                    notification_template["language"],
+                    json.dumps(notification_template["parameters"]),
+                ),
+            )
+        conn.commit()
+
+
+def get_appointment(appointment_id: str) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM appointments WHERE appointment_id = ?",
+            (appointment_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_appointment_by_google_event_id(google_event_id: str) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM appointments WHERE google_event_id = ?",
+            (google_event_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def update_appointment_status(
+    appointment_id: str,
+    status: str,
+    new_start_time: Optional[str] = None,
+    new_end_time: Optional[str] = None,
+    new_google_event_id: Optional[str] = None,
+    notification_template: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM appointments WHERE appointment_id = ?",
+            (appointment_id,),
+        ).fetchone()
+        if not row:
+            return None
+
+        tenant_id = row["tenant_id"]
+        phone = row["phone"]
+
+        conn.execute(
+            """
+            UPDATE appointments
+            SET status = ?,
+                start_time = COALESCE(?, start_time),
+                end_time = COALESCE(?, end_time),
+                google_event_id = COALESCE(?, google_event_id),
+                updated_at = ?
+            WHERE appointment_id = ?
+            """,
+            (status, new_start_time, new_end_time, new_google_event_id, now, appointment_id),
+        )
+
+        preference = None
+        if phone:
+            preference = conn.execute(
+                """
+                SELECT enabled FROM whatsapp_preferences
+                WHERE tenant_id = ? AND phone_number = ?
+                """,
+                (tenant_id, phone),
+            ).fetchone()
+
+        if (
+            preference
+            and preference["enabled"]
+            and notification_template
+            and status in ("CANCELLED", "RESCHEDULED")
+        ):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO notification_outbox (
+                    notification_id, tenant_id, appointment_id, patient_id,
+                    event_type, recipient_phone, template_name,
+                    template_language, template_parameters
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"{tenant_id}:{status}:{appointment_id}",
+                    tenant_id,
+                    appointment_id,
+                    row["call_id"],
+                    phone,
+                    status,
+                    notification_template["name"],
+                    notification_template["language"],
+                    json.dumps(notification_template["parameters"]),
+                ),
+            )
+
+        conn.commit()
+        updated_row = conn.execute(
+            "SELECT * FROM appointments WHERE appointment_id = ?",
+            (appointment_id,),
+        ).fetchone()
+        return dict(updated_row) if updated_row else None
+
+
+def get_clinic_config(tenant_id: str = "default", doctor_id: str = "") -> Dict[str, Any]:
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM clinic_config WHERE tenant_id = ? AND doctor_id = ?",
+            (tenant_id, doctor_id),
+        ).fetchone()
+        if not row and doctor_id:
+            # Fall back to clinic global config
+            row = conn.execute(
+                "SELECT * FROM clinic_config WHERE tenant_id = ? AND doctor_id = ''",
+                (tenant_id,),
+            ).fetchone()
+
+        if row:
+            return {
+                "tenant_id": row["tenant_id"],
+                "doctor_id": row["doctor_id"],
+                "working_days": json.loads(row["working_days"]),
+                "open_time": row["open_time"],
+                "close_time": row["close_time"],
+                "break_windows": json.loads(row["break_windows"]),
+                "holidays": json.loads(row["holidays"]),
+                "timezone": row["timezone"],
+            }
+
+    # Default fallback from environment variables
+    working_days_raw = os.getenv("CLINIC_WORKING_DAYS", "[1,2,3,4,5,6]")
+    try:
+        working_days = json.loads(working_days_raw) if working_days_raw.startswith("[") else [int(x.strip()) for x in working_days_raw.split(",")]
+    except Exception:
+        working_days = [1, 2, 3, 4, 5, 6]
+
+    break_windows_raw = os.getenv("CLINIC_BREAK_WINDOWS", '[{"start":"13:00","end":"14:00"}]')
+    try:
+        break_windows = json.loads(break_windows_raw)
+    except Exception:
+        break_windows = [{"start": "13:00", "end": "14:00"}]
+
+    holidays_raw = os.getenv("CLINIC_HOLIDAYS", "[]")
+    try:
+        holidays = json.loads(holidays_raw)
+    except Exception:
+        holidays = []
+
+    return {
+        "tenant_id": tenant_id,
+        "doctor_id": doctor_id,
+        "working_days": working_days,
+        "open_time": os.getenv("CLINIC_OPEN_TIME", "09:00"),
+        "close_time": os.getenv("CLINIC_CLOSE_TIME", "18:00"),
+        "break_windows": break_windows,
+        "holidays": holidays,
+        "timezone": os.getenv("CLINIC_TIMEZONE", "Asia/Kolkata"),
+    }
+
+
+def upsert_clinic_config(config_data: Dict[str, Any]) -> None:
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    tenant_id = config_data.get("tenant_id", "default")
+    doctor_id = config_data.get("doctor_id", "")
+    working_days = json.dumps(config_data.get("working_days", [1, 2, 3, 4, 5, 6]))
+    open_time = config_data.get("open_time", "09:00")
+    close_time = config_data.get("close_time", "18:00")
+    break_windows = json.dumps(config_data.get("break_windows", [{"start": "13:00", "end": "14:00"}]))
+    holidays = json.dumps(config_data.get("holidays", []))
+    tz = config_data.get("timezone", os.getenv("CLINIC_TIMEZONE", "Asia/Kolkata"))
+
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO clinic_config (
+                tenant_id, doctor_id, working_days, open_time, close_time,
+                break_windows, holidays, timezone, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (tenant_id, doctor_id) DO UPDATE SET
+                working_days = excluded.working_days,
+                open_time = excluded.open_time,
+                close_time = excluded.close_time,
+                break_windows = excluded.break_windows,
+                holidays = excluded.holidays,
+                timezone = excluded.timezone,
+                updated_at = excluded.updated_at
+            """,
+            (tenant_id, doctor_id, working_days, open_time, close_time, break_windows, holidays, tz, now),
+        )
+        conn.commit()
+
+
+def log_audit_event(
+    event_type: str,
+    entity_id: str = "",
+    doctor_id: str = "",
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO audit_log (event_type, entity_id, doctor_id, details)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                event_type,
+                entity_id,
+                doctor_id,
+                json.dumps(details or {}),
+            ),
+        )
+        conn.commit()
 
 
 # Auto-initialize tables when imported

@@ -11,7 +11,7 @@ import hmac
 from contextlib import asynccontextmanager
 from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Query, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 from dotenv import load_dotenv
@@ -23,11 +23,39 @@ from pipecat.transports.websocket.fastapi import (
 from src.utils.audio_helpers import VobizTelephonySerializer, BrowserAudioSerializer
 from src.agent.pipeline import create_agent_pipeline
 from src.tasks.cal_booking import get_available_slots, book_appointment, list_event_types
-from db.database import get_db_connection, save_call_end
+from src.utils.google_auth import (
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET,
+    get_authorization_url,
+    decode_oauth_state,
+    exchange_code_for_tokens,
+    encrypt_token,
+)
+from src.tasks.google_calendar import (
+    seed_slots_for_doctor,
+    get_available_slots_google,
+    book_appointment_google,
+    cancel_appointment_google,
+    reschedule_appointment_google,
+    process_calendar_sync,
+)
+from db.database import (
+    get_db_connection,
+    save_call_end,
+    list_doctors,
+    get_doctor,
+    upsert_doctor,
+    get_clinic_config,
+    get_appointment,
+)
 from src.utils.whatsapp import (
     WHATSAPP_ACCESS_TOKEN,
     WHATSAPP_PHONE_NUMBER_ID,
     WHATSAPP_VERIFY_TOKEN,
+    WHATSAPP_HOSPITAL_NAME,
+    WHATSAPP_HOSPITAL_ADDRESS,
+    WHATSAPP_HOSPITAL_PHONE,
+    WHATSAPP_TIMEZONE,
     log_whatsapp_configuration,
     process_notification_queue,
     process_delivery_webhook,
@@ -35,6 +63,9 @@ from src.utils.whatsapp import (
 )
 
 load_dotenv()
+
+SCHEDULING_PROVIDER = os.getenv("SCHEDULING_PROVIDER", "calcom").lower()
+
 
 async def _notification_worker() -> None:
     while True:
@@ -47,18 +78,35 @@ async def _notification_worker() -> None:
         await asyncio.sleep(5)
 
 
+async def _slot_seed_worker() -> None:
+    while True:
+        try:
+            doctors = list_doctors()
+            for doc in doctors:
+                if doc.get("status") == "active":
+                    await seed_slots_for_doctor(doc["doctor_id"])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Google Calendar slot seeding worker error")
+        await asyncio.sleep(12 * 3600)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     log_whatsapp_configuration()
-    worker = asyncio.create_task(_notification_worker())
+    notif_worker = asyncio.create_task(_notification_worker())
+    seed_worker = asyncio.create_task(_slot_seed_worker())
     try:
         yield
     finally:
-        worker.cancel()
-        try:
-            await worker
-        except asyncio.CancelledError:
-            pass
+        notif_worker.cancel()
+        seed_worker.cancel()
+        for w in (notif_worker, seed_worker):
+            try:
+                await w
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(
@@ -77,14 +125,28 @@ app.add_middleware(
 )
 
 
+@app.get("/health")
 @app.get("/")
-async def root():
-    """Health check and environment status."""
+async def root(request: Request):
+    """Health check and environment status. Redirects browsers to /dashboard automatically."""
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept and request.url.path == "/":
+        return RedirectResponse(url="/dashboard")
+
+    doctors = list_doctors()
+    active_doctors = [d for d in doctors if d.get("status") == "active"]
     return {
         "status": "online",
         "service": "Automated Voice Agent",
+        "scheduling_provider": SCHEDULING_PROVIDER,
+        "stt_provider": os.getenv("STT_PROVIDER", "sarvam").lower(),
+        "tts_provider": os.getenv("TTS_PROVIDER", "sarvam").lower(),
         "integrations": {
+            "google_calendar": bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
+            "google_doctors_count": len(doctors),
+            "google_active_doctors": len(active_doctors),
             "cal_com": bool(os.getenv("CAL.COM_API_KEY") or os.getenv("CAL_COM_API_KEY")),
+            "sarvam": bool(os.getenv("SARVAM_API_KEY")),
             "whatsapp": bool(WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID),
             "deepgram": bool(os.getenv("DEEPGRAM_API_KEY")),
             "llm": bool(os.getenv("OPEN_ROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")),
@@ -95,6 +157,12 @@ async def root():
             "dashboard_ui": "/dashboard",
             "vobiz_inbound_webhook": "/vobiz/inbound",
             "vobiz_audio_stream_ws": "/ws/vobiz-stream",
+            "availability": "/availability?doctorId=&date=&specialty=",
+            "appointments": "/appointments",
+            "doctors": "/doctors",
+            "clinic_info": "/clinic-info",
+            "google_oauth_start": "/oauth/google/start?doctor_id=",
+            "google_webhook": "/webhooks/google/calendar",
             "cal_slots": "/cal/slots?date=YYYY-MM-DD",
             "call_logs": "/calls",
             "whatsapp_webhook": "/webhooks/whatsapp",
@@ -203,15 +271,23 @@ async def dashboard():
             <div class="card">
                 <h2>Service Pipeline Integrations</h2>
                 <div class="status-row">
-                    <span>Cal.com Scheduling API</span>
-                    <span class="pill active">Connected</span>
+                    <span>Scheduling Provider</span>
+                    <span class="pill active" id="provider-pill">Cal.com</span>
+                </div>
+                <div class="status-row">
+                    <span>Google Calendar (per-doctor OAuth)</span>
+                    <span class="pill pending" id="google-status">Configure OAuth</span>
+                </div>
+                <div class="status-row">
+                    <span>Connected Doctors</span>
+                    <span class="pill active" id="doctors-count-pill">0</span>
                 </div>
                 <div class="status-row">
                     <span>VAD Engine (Silero)</span>
                     <span class="pill active">Ready</span>
                 </div>
                 <div class="status-row">
-                    <span>STT Engine (Deepgram Nova-2)</span>
+                    <span id="stt-label">STT Engine (Sarvam Saaras)</span>
                     <span class="pill pending" id="stt-status">Configure in .env</span>
                 </div>
                 <div class="status-row">
@@ -219,20 +295,40 @@ async def dashboard():
                     <span class="pill pending" id="llm-status">Configure in .env</span>
                 </div>
                 <div class="status-row">
-                    <span>TTS Engine (Cartesia Sonic)</span>
+                    <span id="tts-label">TTS Engine (Sarvam Bulbul)</span>
                     <span class="pill pending" id="tts-status">Configure in .env</span>
                 </div>
             </div>
 
-            <!-- Cal.com Slot Checker -->
+            <!-- Doctor Calendar Connection Card -->
             <div class="card">
-                <h2>Live Cal.com Slot Viewer</h2>
-                <div style="display: flex; gap: 0.5rem; align-items: center;">
+                <h2>🩺 Doctor Google Calendar Connect</h2>
+                <p style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 0.8rem;">
+                    Authorize a doctor's personal Gmail account to seed green availability slots and manage live appointments:
+                </p>
+                <div style="display: flex; flex-direction: column; gap: 0.6rem;">
+                    <div style="display: flex; gap: 0.5rem;">
+                        <input type="text" id="oauth-doctor-id" placeholder="doctor_id (e.g. dr_smith)" style="flex: 1;">
+                        <input type="text" id="oauth-doctor-name" placeholder="Name (e.g. Dr. John Smith)" style="flex: 1;">
+                    </div>
+                    <button onclick="startDoctorOAuth()" style="background: #4f46e5; padding: 0.6rem 1rem;">🔗 Connect Doctor Calendar (OAuth 2.0)</button>
+                    <div id="doctor-list-summary" style="font-size: 0.8rem; color: #a5b4fc; margin-top: 0.3rem;"></div>
+                </div>
+            </div>
+
+            <!-- Live Slot Checker -->
+            <div class="card">
+                <h2>Live Availability Viewer</h2>
+                <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
                     <input type="date" id="slot-date">
+                    <select id="slot-provider" style="background: rgba(255,255,255,0.05); border: 1px solid var(--border); color: white; padding: 0.6rem; border-radius: 0.5rem;">
+                        <option value="google">Google Calendar</option>
+                        <option value="calcom">Cal.com</option>
+                    </select>
                     <button onclick="fetchSlots()">Check Slots</button>
                 </div>
                 <div id="slots-list" class="slots-container">
-                    <span style="color: var(--text-muted); font-size: 0.85rem;">Select a date to query Cal.com availability.</span>
+                    <span style="color: var(--text-muted); font-size: 0.85rem;">Select date to query live availability slots.</span>
                 </div>
             </div>
 
@@ -435,37 +531,85 @@ async def dashboard():
             status.innerText = 'Call ended. Ready to test again.';
         }
 
+        function startDoctorOAuth() {
+            const docId = document.getElementById('oauth-doctor-id').value.trim();
+            const docName = document.getElementById('oauth-doctor-name').value.trim();
+            if (!docId) {
+                alert('Please enter a doctor ID (e.g. dr_smith)');
+                return;
+            }
+            window.location.href = `/oauth/google/start?doctor_id=${encodeURIComponent(docId)}&name=${encodeURIComponent(docName)}`;
+        }
+
         async function fetchStatus() {
             try {
                 const res = await fetch('/');
                 const data = await res.json();
+                document.getElementById('provider-pill').innerText = (data.scheduling_provider || 'calcom').toUpperCase();
+                if (data.integrations.google_calendar) {
+                    document.getElementById('google-status').className = 'pill active';
+                    document.getElementById('google-status').innerText = 'Ready';
+                }
+                document.getElementById('doctors-count-pill').innerText = `${data.integrations.google_active_doctors || 0} active (${data.integrations.google_doctors_count || 0} total)`;
+
                 if (data.integrations.llm) {
                     document.getElementById('llm-status').className = 'pill active';
                     document.getElementById('llm-status').innerText = 'Ready';
                     document.getElementById('llm-label').innerText = `LLM Engine (${data.integrations.llm_provider})`;
                 }
-                if (data.integrations.deepgram) {
-                    document.getElementById('stt-status').className = 'pill active';
-                    document.getElementById('stt-status').innerText = 'Ready';
+                const sttProv = (data.stt_provider || 'sarvam').toLowerCase();
+                const ttsProv = (data.tts_provider || 'sarvam').toLowerCase();
+
+                if (sttProv === 'sarvam') {
+                    document.getElementById('stt-label').innerText = 'STT Engine (Sarvam Saaras)';
+                    if (data.integrations.sarvam) {
+                        document.getElementById('stt-status').className = 'pill active';
+                        document.getElementById('stt-status').innerText = 'Ready (Sarvam)';
+                    }
+                } else {
+                    document.getElementById('stt-label').innerText = 'STT Engine (Deepgram Nova-2)';
+                    if (data.integrations.deepgram) {
+                        document.getElementById('stt-status').className = 'pill active';
+                        document.getElementById('stt-status').innerText = 'Ready (Deepgram)';
+                    }
                 }
-                if (data.integrations.cartesia) {
-                    document.getElementById('tts-status').className = 'pill active';
-                    document.getElementById('tts-status').innerText = 'Ready';
+
+                if (ttsProv === 'sarvam') {
+                    document.getElementById('tts-label').innerText = 'TTS Engine (Sarvam Bulbul - kavya)';
+                    if (data.integrations.sarvam) {
+                        document.getElementById('tts-status').className = 'pill active';
+                        document.getElementById('tts-status').innerText = 'Ready (Sarvam)';
+                    }
+                } else {
+                    document.getElementById('tts-label').innerText = 'TTS Engine (Cartesia Sonic)';
+                    if (data.integrations.cartesia) {
+                        document.getElementById('tts-status').className = 'pill active';
+                        document.getElementById('tts-status').innerText = 'Ready (Cartesia)';
+                    }
+                }
+
+                // Fetch doctors list
+                const docRes = await fetch('/doctors');
+                const docData = await docRes.json();
+                if (docData.doctors && docData.doctors.length > 0) {
+                    document.getElementById('doctor-list-summary').innerText = 'Connected: ' + docData.doctors.map(d => `${d.name} (${d.doctor_id})`).join(', ');
                 }
             } catch(e) {}
         }
 
         async function fetchSlots() {
             const date = document.getElementById('slot-date').value;
+            const provider = document.getElementById('slot-provider').value;
             const container = document.getElementById('slots-list');
-            container.innerHTML = '<span style="color: #9ca3af;">Checking Cal.com...</span>';
+            container.innerHTML = `<span style="color: #9ca3af;">Checking ${provider.toUpperCase()} availability...</span>`;
             try {
-                const res = await fetch(`/cal/slots?date=${date}`);
+                const res = await fetch(`/availability?date=${date}&provider=${provider}`);
                 const data = await res.json();
                 if (data.slots && data.slots.length > 0) {
                     container.innerHTML = data.slots.map(s => {
-                        const time = new Date(s).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-                        return `<div class="slot-pill">${time}</div>`;
+                        const time = typeof s === 'string' ? new Date(s).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : (s.display_time || s.start_time);
+                        const label = typeof s === 'object' && s.doctor_name ? `${s.doctor_name}: ${time}` : time;
+                        return `<div class="slot-pill">${label}</div>`;
                     }).join('');
                 } else {
                     container.innerHTML = '<span style="color: #f87171;">No slots available on this date.</span>';
@@ -540,6 +684,248 @@ async def receive_whatsapp_webhook(request: Request):
 
     process_delivery_webhook(payload)
     return JSONResponse({"status": "ok"})
+
+
+# =========================================================
+# GOOGLE CALENDAR PER-DOCTOR SCHEDULING & OAUTH ENDPOINTS
+# =========================================================
+
+@app.get("/oauth/google/start")
+async def google_oauth_start(
+    doctor_id: str = Query(..., description="Unique Doctor ID"),
+    name: Optional[str] = Query(None, description="Doctor Name"),
+    specialty: Optional[str] = Query(None, description="Doctor Specialty"),
+    request: Request = None,
+):
+    """Initiates Google OAuth 2.0 authorization code flow for a doctor's personal calendar."""
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail="GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET is not configured in .env",
+        )
+
+    existing = get_doctor(doctor_id)
+    if not existing:
+        upsert_doctor({
+            "doctor_id": doctor_id,
+            "name": name or f"Dr. {doctor_id.title()}",
+            "specialty": specialty or "General Medicine",
+            "status": "needs_reconnect",
+        })
+
+    host = request.headers.get("host", "localhost:8000")
+    scheme = request.url.scheme
+    redirect_uri = f"{scheme}://{host}/oauth/google/callback"
+    auth_url, _ = get_authorization_url(doctor_id=doctor_id, redirect_uri=redirect_uri)
+    return RedirectResponse(url=auth_url)
+
+
+@app.get("/oauth/google/callback")
+async def google_oauth_callback(
+    code: str = Query(..., description="Authorization code"),
+    state: str = Query(..., description="State parameter from Google"),
+    request: Request = None,
+):
+    """Exchanges Google OAuth code for refresh token, stores it securely, and triggers slot seeding."""
+    state_data = decode_oauth_state(state)
+    doctor_id = state_data.get("doctor_id")
+    if not doctor_id:
+        raise HTTPException(status_code=400, detail="Invalid state payload in OAuth callback")
+
+    host = request.headers.get("host", "localhost:8000")
+    scheme = request.url.scheme
+    redirect_uri = f"{scheme}://{host}/oauth/google/callback"
+
+    try:
+        token_data = exchange_code_for_tokens(code=code, redirect_uri=redirect_uri)
+    except Exception as exc:
+        logger.error(f"Failed to exchange OAuth code for doctor {doctor_id}: {exc}")
+        raise HTTPException(status_code=400, detail=f"OAuth token exchange failed: {exc}")
+
+    refresh_token = token_data.get("refresh_token")
+    encrypted_refresh = encrypt_token(refresh_token) if refresh_token else None
+
+    doc = get_doctor(doctor_id) or {"doctor_id": doctor_id}
+    upsert_doctor({
+        "doctor_id": doctor_id,
+        "name": doc.get("name", f"Dr. {doctor_id.title()}"),
+        "email": doc.get("email", ""),
+        "encrypted_refresh_token": encrypted_refresh,
+        "status": "active",
+    })
+
+    # Trigger initial slot seeding
+    asyncio.create_task(seed_slots_for_doctor(doctor_id))
+
+    return HTMLResponse(content=f"""
+    <html>
+        <body style="font-family: system-ui; background: #0f172a; color: white; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
+            <div style="background: #1e293b; padding: 2.5rem; border-radius: 1rem; text-align: center; max-width: 480px; box-shadow: 0 10px 25px rgba(0,0,0,0.5);">
+                <div style="font-size: 3rem; margin-bottom: 1rem;">✅</div>
+                <h2 style="margin: 0 0 0.5rem 0;">Google Calendar Connected!</h2>
+                <p style="color: #94a3b8; font-size: 0.95rem;">Calendar for doctor <strong>{doctor_id}</strong> is successfully connected. Initial availability slots are being seeded.</p>
+                <a href="/dashboard" style="display: inline-block; margin-top: 1.5rem; background: #6366f1; color: white; padding: 0.75rem 1.5rem; border-radius: 0.5rem; text-decoration: none; font-weight: 600;">Return to Dashboard</a>
+            </div>
+        </body>
+    </html>
+    """)
+
+
+@app.post("/webhooks/google/calendar")
+async def google_calendar_webhook(request: Request):
+    """Receives push notifications from Google Calendar watch channels and processes changes."""
+    channel_id = request.headers.get("X-Goog-Channel-ID")
+    resource_state = request.headers.get("X-Goog-Resource-State")
+    logger.info(f"Google Calendar webhook received. Channel: {channel_id}, State: {resource_state}")
+
+    if resource_state == "sync":
+        return JSONResponse({"status": "sync_acknowledged"})
+
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT doctor_id FROM calendar_sync_state WHERE channel_id = ?",
+            (channel_id,),
+        ).fetchone()
+
+    target_doctor_id = row["doctor_id"] if row else None
+    if not target_doctor_id and channel_id and channel_id.startswith("chan_"):
+        parts = channel_id.split("_")
+        if len(parts) >= 2:
+            target_doctor_id = parts[1]
+
+    if target_doctor_id:
+        asyncio.create_task(process_calendar_sync(target_doctor_id))
+
+    return JSONResponse({"status": "ok"})
+
+
+@app.get("/availability")
+async def check_availability_endpoint(
+    doctorId: Optional[str] = Query(None, description="Doctor ID or name filter"),
+    date: Optional[str] = Query(None, description="Target date in YYYY-MM-DD format"),
+    specialty: Optional[str] = Query(None, description="Doctor specialty filter"),
+    provider: Optional[str] = Query(None, description="Provider override (google or calcom)"),
+):
+    """Query live availability slots for a date."""
+    chosen_provider = (provider or SCHEDULING_PROVIDER).lower()
+    if chosen_provider == "google":
+        slots = await get_available_slots_google(
+            doctor_or_specialty=doctorId or specialty,
+            date_str=date,
+        )
+        return {
+            "provider": "google",
+            "date": date,
+            "doctorId": doctorId,
+            "specialty": specialty,
+            "slots": slots,
+            "count": len(slots),
+        }
+    else:
+        slots = await get_available_slots(date_str=date or "")
+        return {
+            "provider": "calcom",
+            "date": date,
+            "slots": slots,
+            "count": len(slots),
+        }
+
+
+@app.post("/appointments")
+async def create_appointment_endpoint(request: Request):
+    """Book a new appointment against Google Calendar with conflict prevention."""
+    data = await request.json()
+    doctor_id = data.get("doctorId") or data.get("doctor_id")
+    slot_start = data.get("slotStart") or data.get("slot_start") or data.get("start_time")
+    patient_name = data.get("patientName") or data.get("patient_name") or data.get("name")
+    phone = data.get("phone")
+    email = data.get("email")
+    reason = data.get("reason", "")
+    call_id = data.get("callId") or data.get("call_id")
+
+    if not doctor_id or not slot_start or not patient_name:
+        raise HTTPException(status_code=400, detail="doctorId, slotStart, and patientName are required")
+
+    result = await book_appointment_google(
+        doctor_id=doctor_id,
+        slot_start=slot_start,
+        patient_name=patient_name,
+        phone=phone or "",
+        email=email,
+        reason=reason,
+        call_id=call_id,
+    )
+
+    if result.get("status") == "conflict" or result.get("code") == 409:
+        return JSONResponse(status_code=409, content=result)
+    if result.get("status") == "error":
+        return JSONResponse(status_code=400, content=result)
+    return JSONResponse(status_code=201, content=result)
+
+
+@app.post("/appointments/{appointment_id}/cancel")
+async def cancel_appointment_endpoint(appointment_id: str, request: Request):
+    """Cancel an appointment and restore green slot availability."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    result = await cancel_appointment_google(appointment_id=appointment_id, reason=body.get("reason"))
+    if result.get("status") == "error":
+        raise HTTPException(status_code=404, detail=result.get("message"))
+    return result
+
+
+@app.post("/appointments/{appointment_id}/reschedule")
+async def reschedule_appointment_endpoint(appointment_id: str, request: Request):
+    """Reschedule an existing appointment to a new time slot."""
+    body = await request.json()
+    new_slot = body.get("newSlotStart") or body.get("new_slot_start") or body.get("start_time")
+    if not new_slot:
+        raise HTTPException(status_code=400, detail="newSlotStart is required")
+    result = await reschedule_appointment_google(appointment_id=appointment_id, new_slot_start=new_slot)
+    if result.get("status") == "conflict" or result.get("code") == 409:
+        return JSONResponse(status_code=409, content=result)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+@app.get("/clinic-info")
+async def get_clinic_info_endpoint():
+    """Returns clinic timings, working hours, break windows, and address info."""
+    config = get_clinic_config()
+    doctors = list_doctors()
+    return {
+        "clinic_name": WHATSAPP_HOSPITAL_NAME or "City Care Medical Center",
+        "address": WHATSAPP_HOSPITAL_ADDRESS or "100 Health Avenue, Suite 400",
+        "phone": WHATSAPP_HOSPITAL_PHONE or "+1-800-555-CARE",
+        "timezone": config.get("timezone", WHATSAPP_TIMEZONE),
+        "working_days": config.get("working_days"),
+        "open_time": config.get("open_time"),
+        "close_time": config.get("close_time"),
+        "break_windows": config.get("break_windows"),
+        "holidays": config.get("holidays"),
+        "doctors_count": len(doctors),
+    }
+
+
+@app.get("/doctors")
+async def list_doctors_endpoint(specialty: Optional[str] = None):
+    """Returns list of registered doctors with their status and specialty."""
+    docs = list_doctors(specialty=specialty)
+    sanitized = []
+    for d in docs:
+        sanitized.append({
+            "doctor_id": d["doctor_id"],
+            "name": d["name"],
+            "email": d["email"],
+            "specialty": d.get("specialty"),
+            "slot_duration_minutes": d.get("slot_duration_minutes"),
+            "timezone": d.get("timezone"),
+            "status": d.get("status"),
+        })
+    return {"doctors": sanitized}
 
 
 # ==========================================
