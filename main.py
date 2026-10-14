@@ -1057,6 +1057,10 @@ async def browser_websocket_stream(websocket: WebSocket):
     finally:
         save_call_end(call_id=call_session_id, transcript="Browser test completed", status="completed")
         logger.info(f"Cleaned up browser call {call_session_id}")
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ from pipecat.services.sarvam.tts import SarvamTTSService
 from pipecat.services.llm_service import FunctionCallParams
 
 from src.agent.prompts import get_system_prompt
+from src.agent.filler_processor import FillerProcessor, FillerBank
 from src.tasks.cal_booking import get_available_slots as cal_get_available_slots, book_appointment as cal_book_appointment
 from src.tasks.google_calendar import (
     get_available_slots_google,
@@ -57,6 +58,8 @@ from src.utils.whatsapp import (
 )
 
 load_dotenv()
+
+_shared_filler_bank = FillerBank()
 
 SCHEDULING_PROVIDER = os.getenv("SCHEDULING_PROVIDER", "calcom").lower()
 
@@ -147,25 +150,24 @@ def create_agent_pipeline(
             ),
         )
 
+    doctor_name = os.getenv("DOCTOR_NAME", "Dr. Patil").strip()
+    clinic_name = os.getenv("CLINIC_NAME", f"{doctor_name}'s Clinic").strip()
+
     # 5. Define Tool Schemas
     clinic_timings_schema = FunctionSchema(
         name="get_clinic_timings",
-        description="Get official clinic working hours, break windows, working days, holidays, and address.",
+        description=f"Get official clinic working hours, break windows, working days, holidays, and address for {clinic_name}.",
         properties={},
         required=[],
     )
 
     check_slots_schema = FunctionSchema(
         name="check_available_slots",
-        description="Check available doctor appointment slots for a specific date (YYYY-MM-DD), with optional doctor or specialty filter.",
+        description=f"Check available appointment slots with {doctor_name} for a specific date (YYYY-MM-DD).",
         properties={
             "date": {
                 "type": "string",
                 "description": "Date in YYYY-MM-DD format (e.g. 2026-10-15).",
-            },
-            "doctor_or_specialty": {
-                "type": "string",
-                "description": "Optional doctor name (e.g. Dr. Sharma) or specialty (e.g. Dentist, Cardiology).",
             },
         },
         required=["date"],
@@ -173,7 +175,7 @@ def create_agent_pipeline(
 
     book_appt_schema = FunctionSchema(
         name="book_appointment",
-        description="Confirm and book an appointment with doctor, date/time slot, and patient details.",
+        description=f"Confirm and book an appointment with {doctor_name}, date/time slot, and patient details.",
         properties={
             "slot_start": {
                 "type": "string",
@@ -182,18 +184,6 @@ def create_agent_pipeline(
             "name": {
                 "type": "string",
                 "description": "Full name of the patient.",
-            },
-            "phone": {
-                "type": "string",
-                "description": "Phone number of the patient.",
-            },
-            "doctor_id": {
-                "type": "string",
-                "description": "Doctor ID or doctor name (optional, defaults to primary doctor).",
-            },
-            "email": {
-                "type": "string",
-                "description": "Email address of the patient (optional).",
             },
             "reason": {
                 "type": "string",
@@ -235,66 +225,67 @@ def create_agent_pipeline(
         required=["appointment_id", "new_slot_start"],
     )
 
-    whatsapp_preferences_schema = FunctionSchema(
-        name="manage_whatsapp_notifications",
-        description=(
-            "Record the caller's explicit choice to enable or disable appointment "
-            "confirmation messages on their WhatsApp number."
-        ),
+    end_call_schema = FunctionSchema(
+        name="end_call",
+        description="End and hang up the phone call immediately after bidding farewell to the caller, or when the caller says goodbye, confirms they have no more questions, or requests to hang up.",
         properties={
-            "enabled": {
-                "type": "boolean",
-                "description": (
-                    "True only after the caller explicitly agrees; false when they "
-                    "decline or request that WhatsApp notifications be stopped."
-                ),
+            "reason": {
+                "type": "string",
+                "description": "Brief reason for ending the call.",
             }
         },
-        required=["enabled"],
+        required=[],
     )
 
-    # 6. Register Tool Handlers
+    # 6. Latency-Masking Filler Processor (Instant zero-delay audio playback)
+    filler_processor = FillerProcessor(
+        filler_bank=_shared_filler_bank,
+        latency_threshold_secs=0.75,
+        sample_rate=16000,
+    )
+
+    # 7. Register Tool Handlers
     async def handle_clinic_timings(params: FunctionCallParams):
-        logger.info("Fetching clinic timings")
+        logger.info(f"Fetching clinic timings for {clinic_name}")
+        await filler_processor.trigger_filler("clinic")
         cfg = get_clinic_config()
-        doctors = list_doctors()
-        doc_names = [f"{d['name']} ({d.get('specialty', 'General')})" for d in doctors if d.get('status') == 'active']
         await params.result_callback({
             "status": "success",
-            "clinic_name": WHATSAPP_HOSPITAL_NAME or "City Care Medical Center",
+            "clinic_name": clinic_name,
+            "doctor": doctor_name,
             "address": WHATSAPP_HOSPITAL_ADDRESS or "100 Health Avenue, Suite 400",
             "phone": WHATSAPP_HOSPITAL_PHONE or "+1-800-555-CARE",
             "open_time": cfg.get("open_time", "09:00 AM"),
             "close_time": cfg.get("close_time", "06:00 PM"),
             "break_hours": "1:00 PM to 2:00 PM",
             "working_days": "Monday through Saturday",
-            "active_doctors": doc_names or ["Dr. General Practice"],
         })
 
     async def handle_check_slots(params: FunctionCallParams):
         date_str = params.arguments.get("date", "")
-        doc_query = params.arguments.get("doctor_or_specialty", "")
-        logger.info(f"Checking slots for date={date_str}, doctor/specialty={doc_query}")
+        logger.info(f"Checking slots for date={date_str} with {doctor_name}")
+        # Play immediate latency-masking clip while checking Google / Cal.com calendar
+        await filler_processor.trigger_filler("slots")
 
         if SCHEDULING_PROVIDER == "google":
             slots = await get_available_slots_google(
-                doctor_or_specialty=doc_query,
+                doctor_or_specialty=doctor_name,
                 date_str=date_str,
             )
             if slots:
-                # Offer up to 3 slots
+                # Provide a healthy selection of up to 10 slots across morning and afternoon
                 offered = [
                     {
-                        "doctor_name": s["doctor_name"],
+                        "doctor_name": doctor_name,
                         "time": s["display_time"],
                         "slot_start": s["start_time"],
-                        "doctor_id": s["doctor_id"],
                     }
-                    for s in slots[:3]
+                    for s in slots[:10]
                 ]
                 await params.result_callback({
                     "status": "success",
                     "date": date_str,
+                    "doctor": doctor_name,
                     "available_slots": offered,
                     "total_slots": len(slots),
                 })
@@ -304,7 +295,7 @@ def create_agent_pipeline(
                     from datetime import datetime, timedelta
                     target_dt = datetime.strptime(date_str, "%Y-%m-%d").date()
                     next_day_str = (target_dt + timedelta(days=1)).strftime("%Y-%m-%d")
-                    next_slots = await get_available_slots_google(doctor_or_specialty=doc_query, date_str=next_day_str)
+                    next_slots = await get_available_slots_google(doctor_or_specialty=doctor_name, date_str=next_day_str)
                     next_day_info = f" The next available day is {next_day_str}." if next_slots else ""
                 except Exception:
                     next_day_info = ""
@@ -316,46 +307,38 @@ def create_agent_pipeline(
         else:
             slots = await cal_get_available_slots(date_str)
             if slots:
-                available = slots[:3]
+                # Provide up to 10 slots
+                available = slots[:10]
                 await params.result_callback({
                     "status": "success",
                     "date": date_str,
+                    "doctor": doctor_name,
                     "available_slots": available,
                     "count": len(slots),
                 })
             else:
                 await params.result_callback({
                     "status": "none_available",
-                    "message": f"No available slots found for {date_str}. Please ask the user for another date.",
+                    "message": f"No available slots found for {date_str}. Please ask the caller for another date.",
                 })
 
     async def handle_book_appt(params: FunctionCallParams):
         slot_start = params.arguments.get("slot_start") or params.arguments.get("start_time", "")
         name = params.arguments.get("name", "")
-        phone = params.arguments.get("phone") or caller_phone
-        email = params.arguments.get("email", "")
-        doctor_id = params.arguments.get("doctor_id", "")
-        reason = params.arguments.get("reason") or params.arguments.get("notes", "")
+        phone = params.arguments.get("phone") or caller_phone or "+91-Caller"
+        reason = params.arguments.get("reason") or params.arguments.get("notes", "General Consultation")
 
-        logger.info(f"Booking appointment for {name} ({phone}) at {slot_start}")
+        logger.info(f"Booking appointment with {doctor_name} for {name} ({phone}) at {slot_start}")
+        # Play immediate booking confirmation filler while calendar booking runs
+        await filler_processor.trigger_filler("booking")
 
         if SCHEDULING_PROVIDER == "google":
-            # If doctor_id is missing or name was provided instead, resolve doctor
-            if not doctor_id:
-                active_docs = [d for d in list_doctors() if d.get("status") == "active"]
-                doctor_id = active_docs[0]["doctor_id"] if active_docs else "default_doc"
-            else:
-                for doc in list_doctors():
-                    if doctor_id.lower() in doc["name"].lower():
-                        doctor_id = doc["doctor_id"]
-                        break
-
             result = await book_appointment_google(
-                doctor_id=doctor_id,
+                doctor_id=doctor_name,
                 slot_start=slot_start,
                 patient_name=name,
                 phone=phone,
-                email=email,
+                email="",
                 reason=reason,
                 call_id=call_id,
             )
@@ -364,7 +347,7 @@ def create_agent_pipeline(
             result = await cal_book_appointment(
                 start_time=slot_start,
                 name=name,
-                email=email,
+                email="",
                 phone=phone,
                 notes=reason,
                 call_id=call_id,
@@ -385,49 +368,28 @@ def create_agent_pipeline(
         result = await reschedule_appointment_google(appointment_id=appointment_id, new_slot_start=new_slot_start)
         await params.result_callback(result)
 
-    async def handle_whatsapp_preferences(params: FunctionCallParams):
-        enabled = params.arguments.get("enabled")
-        if not isinstance(enabled, bool):
-            await params.result_callback(
-                {"success": False, "message": "A clear enable or disable choice is required."}
-            )
-            return
-        if not is_valid_e164_phone(caller_phone):
-            await params.result_callback(
-                {
-                    "success": False,
-                    "message": (
-                        "The caller ID is not a valid international phone number. "
-                        "Do not enable WhatsApp notifications."
-                    ),
-                }
-            )
-            return
-        set_whatsapp_preference(
-            tenant_id=WHATSAPP_TENANT_ID,
-            phone_number=caller_phone,
-            enabled=enabled,
-            consent_source="voice_call",
-            consent_text_version="whatsapp-consent-v1",
-        )
-        await params.result_callback(
-            {
-                "success": True,
-                "enabled": enabled,
-                "message": (
-                    "WhatsApp notifications are enabled."
-                    if enabled
-                    else "WhatsApp notifications are disabled."
-                ),
-            }
-        )
+    async def handle_end_call(params: FunctionCallParams):
+        reason = params.arguments.get("reason", "Caller finished")
+        logger.info(f"Ending call {call_id}: {reason}")
+        await params.result_callback({
+            "status": "call_ended",
+            "message": "Call ending. Say your brief goodbye sentence.",
+        })
+
+        async def graceful_close():
+            # Wait 2.5 seconds to let the farewell audio finish playback
+            await asyncio.sleep(2.5)
+            logger.info(f"Executing graceful call termination for {call_id}")
+            await task.cancel()
+
+        asyncio.create_task(graceful_close())
 
     llm.register_function("get_clinic_timings", handle_clinic_timings)
     llm.register_function("check_available_slots", handle_check_slots)
     llm.register_function("book_appointment", handle_book_appt)
     llm.register_function("cancel_appointment", handle_cancel_appt)
     llm.register_function("reschedule_appointment", handle_reschedule_appt)
-    llm.register_function("manage_whatsapp_notifications", handle_whatsapp_preferences)
+    llm.register_function("end_call", handle_end_call)
 
     # 7. TTS (Text-to-Speech: Sarvam Bulbul or Cartesia Sonic or OpenAI)
     tts_provider = os.getenv("TTS_PROVIDER", "sarvam").strip().lower()
@@ -475,7 +437,7 @@ def create_agent_pipeline(
             book_appt_schema,
             cancel_appt_schema,
             reschedule_appt_schema,
-            whatsapp_preferences_schema,
+            end_call_schema,
         ],
     )
     user_params = LLMUserAggregatorParams(
@@ -493,6 +455,7 @@ def create_agent_pipeline(
         context_aggregator.user(),
         llm,
         tts,
+        filler_processor,
         transport.output(),
         context_aggregator.assistant(),
     ])
@@ -504,10 +467,12 @@ def create_agent_pipeline(
 
     # Initial greeting trigger
     async def trigger_greeting():
+        # Short delay to allow browser audio WebSocket handshake to settle
+        await asyncio.sleep(0.4)
         greeting_prompt = (
-            f"Greet returning caller {caller_name} warmly and ask how you can help."
+            f"Greet returning caller {caller_name} warmly on behalf of {clinic_name}. Introduce yourself as Jacqueline and ask how you can assist them with {doctor_name} today."
             if caller_name
-            else "Greet the caller warmly and ask how you can assist them today."
+            else f"Greet the caller warmly. Say: 'Hello! Thank you for calling {clinic_name}. I am Jacqueline, how can I assist you with {doctor_name} today?'"
         )
         await task.queue_frames([
             LLMMessagesAppendFrame(
