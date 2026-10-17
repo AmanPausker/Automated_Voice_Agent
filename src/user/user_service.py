@@ -23,7 +23,7 @@ def get_caller_profile(phone_number: str) -> Dict[str, Any]:
             SELECT guest_name, guest_email, start_time, notes, status
             FROM bookings
             WHERE call_id IN (SELECT call_id FROM calls WHERE caller_number = ?)
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, id DESC
             LIMIT 1
             """,
             (phone_number,)

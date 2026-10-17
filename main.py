@@ -32,7 +32,9 @@ from src.utils.whatsapp import (
     process_notification_queue,
     process_delivery_webhook,
     verify_webhook_signature,
+    send_direct_whatsapp_message,
 )
+from src.utils.gmail import send_booking_confirmation_email, is_gmail_configured
 
 load_dotenv()
 
@@ -77,7 +79,8 @@ app.add_middleware(
 )
 
 
-@app.get("/")
+@app.get("/api/status")
+@app.get("/health")
 async def root():
     """Health check and environment status."""
     return {
@@ -86,13 +89,18 @@ async def root():
         "integrations": {
             "cal_com": bool(os.getenv("CAL.COM_API_KEY") or os.getenv("CAL_COM_API_KEY")),
             "whatsapp": bool(WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID),
+            "whatsapp_mode": "Live Meta Cloud API" if (WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID) else "Simulated & DB Outbox",
+            "gmail": is_gmail_configured(),
+            "gmail_mode": "Live SMTP (Gmail)" if is_gmail_configured() else "Simulated Delivery",
             "deepgram": bool(os.getenv("DEEPGRAM_API_KEY")),
-            "llm": bool(os.getenv("OPEN_ROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")),
-            "llm_provider": "OpenRouter (gpt-4o-mini)" if (os.getenv("OPEN_ROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY")) else ("OpenAI" if os.getenv("OPENAI_API_KEY") else "None"),
+            "sarvam": bool(os.getenv("SARVAM_API_KEY")),
+            "stt_provider": "Sarvam AI (Saaras)" if os.getenv("SARVAM_API_KEY") else ("Deepgram" if os.getenv("DEEPGRAM_API_KEY") else "None"),
+            "llm": bool(os.getenv("OPEN_ROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY") or os.getenv("SARVAM_API_KEY") or os.getenv("OPENAI_API_KEY")),
+            "llm_provider": "OpenRouter (gpt-4o-mini)" if (os.getenv("OPEN_ROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY")) else ("Sarvam AI (sarvam-105b)" if os.getenv("SARVAM_API_KEY") else ("OpenAI" if os.getenv("OPENAI_API_KEY") else "None")),
             "cartesia": bool(os.getenv("CARTESIA_API_KEY")),
         },
         "endpoints": {
-            "dashboard_ui": "/dashboard",
+            "dashboard_ui": "/",
             "vobiz_inbound_webhook": "/vobiz/inbound",
             "vobiz_audio_stream_ws": "/ws/vobiz-stream",
             "cal_slots": "/cal/slots?date=YYYY-MM-DD",
@@ -102,6 +110,7 @@ async def root():
     }
 
 
+@app.get("/", response_class=HTMLResponse)
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     """Interactive visual dashboard for inspecting voice agent status, Cal.com slots, and call logs."""
@@ -204,18 +213,26 @@ async def dashboard():
                 <h2>Service Pipeline Integrations</h2>
                 <div class="status-row">
                     <span>Cal.com Scheduling API</span>
-                    <span class="pill active">Connected</span>
+                    <span class="pill active" id="cal-status">Active</span>
+                </div>
+                <div class="status-row">
+                    <span>WhatsApp Notifications</span>
+                    <span class="pill active" id="whatsapp-status">Active</span>
+                </div>
+                <div class="status-row">
+                    <span>Gmail / SMTP Notifications</span>
+                    <span class="pill active" id="gmail-status">Active</span>
                 </div>
                 <div class="status-row">
                     <span>VAD Engine (Silero)</span>
                     <span class="pill active">Ready</span>
                 </div>
                 <div class="status-row">
-                    <span>STT Engine (Deepgram Nova-2)</span>
+                    <span>STT Engine</span>
                     <span class="pill pending" id="stt-status">Configure in .env</span>
                 </div>
                 <div class="status-row">
-                    <span id="llm-label">LLM Engine (OpenRouter / OpenAI)</span>
+                    <span id="llm-label">LLM Engine</span>
                     <span class="pill pending" id="llm-status">Configure in .env</span>
                 </div>
                 <div class="status-row">
@@ -234,6 +251,23 @@ async def dashboard():
                 <div id="slots-list" class="slots-container">
                     <span style="color: var(--text-muted); font-size: 0.85rem;">Select a date to query Cal.com availability.</span>
                 </div>
+            </div>
+
+            <!-- Instant Booking & Notification Tester -->
+            <div class="card">
+                <h2>Test Booking & Notifications</h2>
+                <p style="color: var(--text-muted); font-size: 0.82rem; margin-bottom: 0.8rem;">
+                    Triggers Cal.com booking, records into SQLite, and dispatches both Gmail and WhatsApp confirmations:
+                </p>
+                <div style="display: flex; flex-direction: column; gap: 0.5rem;">
+                    <input type="text" id="test-name" placeholder="Patient Name (e.g. John Doe)" value="Aman Patient">
+                    <input type="email" id="test-email" placeholder="Email Address (for Gmail confirmation)" value="patient@example.com">
+                    <input type="tel" id="test-phone" placeholder="Phone (+91... for WhatsApp)" value="+919876543210">
+                    <button onclick="testBooking()" style="background: linear-gradient(135deg, #4f46e5, #7c3aed); margin-top: 0.3rem;">
+                        ⚡ Book Slot & Dispatch Notifications
+                    </button>
+                </div>
+                <div id="test-result" style="margin-top: 0.6rem; font-size: 0.8rem; color: #a5b4fc; display: none;"></div>
             </div>
 
             <!-- Vobiz Webhook Setup -->
@@ -437,20 +471,41 @@ async def dashboard():
 
         async function fetchStatus() {
             try {
-                const res = await fetch('/');
+                const res = await fetch('/api/status');
                 const data = await res.json();
                 if (data.integrations.llm) {
                     document.getElementById('llm-status').className = 'pill active';
                     document.getElementById('llm-status').innerText = 'Ready';
                     document.getElementById('llm-label').innerText = `LLM Engine (${data.integrations.llm_provider})`;
                 }
-                if (data.integrations.deepgram) {
+                if (data.integrations.sarvam || data.integrations.deepgram) {
                     document.getElementById('stt-status').className = 'pill active';
-                    document.getElementById('stt-status').innerText = 'Ready';
+                    document.getElementById('stt-status').innerText = `Ready (${data.integrations.stt_provider})`;
                 }
                 if (data.integrations.cartesia) {
                     document.getElementById('tts-status').className = 'pill active';
-                    document.getElementById('tts-status').innerText = 'Ready';
+                    document.getElementById('tts-status').innerText = 'Ready (Sonic)';
+                }
+                if (data.integrations.cal_com) {
+                    document.getElementById('cal-status').className = 'pill active';
+                    document.getElementById('cal-status').innerText = 'Live Cal.com v2';
+                } else {
+                    document.getElementById('cal-status').className = 'pill active';
+                    document.getElementById('cal-status').innerText = 'Enabled (Fallback Slots)';
+                }
+                if (data.integrations.whatsapp) {
+                    document.getElementById('whatsapp-status').className = 'pill active';
+                    document.getElementById('whatsapp-status').innerText = 'Live Meta Cloud API';
+                } else {
+                    document.getElementById('whatsapp-status').className = 'pill active';
+                    document.getElementById('whatsapp-status').innerText = 'Enabled (DB & Simulated)';
+                }
+                if (data.integrations.gmail) {
+                    document.getElementById('gmail-status').className = 'pill active';
+                    document.getElementById('gmail-status').innerText = 'Live Gmail SMTP';
+                } else {
+                    document.getElementById('gmail-status').className = 'pill active';
+                    document.getElementById('gmail-status').innerText = 'Enabled (Simulated)';
                 }
             } catch(e) {}
         }
@@ -475,8 +530,70 @@ async def dashboard():
             }
         }
 
+        async function fetchCalls() {
+            try {
+                const res = await fetch('/calls');
+                const data = await res.json();
+                const container = document.getElementById('calls-table');
+                if (data.bookings && data.bookings.length > 0) {
+                    container.innerHTML = '<div style="overflow-x: auto;"><table style="width:100%; border-collapse: collapse; font-size:0.85rem;">' +
+                        '<tr style="border-bottom:1px solid rgba(255,255,255,0.1); text-align:left; color:#9ca3af;">' +
+                        '<th style="padding:8px;">Booking ID</th><th>Patient</th><th>Email</th><th>Phone</th><th>Scheduled For</th><th>Status</th></tr>' +
+                        data.bookings.map(b => `<tr style="border-bottom:1px solid rgba(255,255,255,0.05);">' +
+                            '<td style="padding:8px; font-weight:600; color:#a5b4fc;">${b.cal_booking_id || b.id}</td>' +
+                            '<td>${b.guest_name || "-"}</td>' +
+                            '<td>${b.guest_email || "-"}</td>' +
+                            '<td>${b.phone_number || "-"}</td>' +
+                            '<td>${b.start_time}</td>' +
+                            '<td><span class="pill active">Confirmed</span></td></tr>`).join('') +
+                        '</table></div>';
+                } else {
+                    container.innerHTML = 'No bookings recorded yet. Use the tester above or speak with Jacqueline to book!';
+                }
+            } catch(e) {}
+        }
+
+        async function testBooking() {
+            const name = document.getElementById('test-name').value;
+            const email = document.getElementById('test-email').value;
+            const phone = document.getElementById('test-phone').value;
+            const resultBox = document.getElementById('test-result');
+            resultBox.style.display = 'block';
+            resultBox.innerHTML = 'Booking slot and dispatching notifications...';
+
+            try {
+                const date = document.getElementById('slot-date').value || '2026-10-18';
+                const res = await fetch('/cal/book', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        name: name,
+                        email: email,
+                        phone: phone,
+                        start_time: `${date}T10:00:00+05:30`,
+                        notes: 'Online test consultation'
+                    })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    resultBox.innerHTML = `✅ <strong>Booked Reference:</strong> ${data.booking_id}<br>` +
+                        `📧 <strong>Gmail:</strong> ${data.email_status}<br>` +
+                        `📱 <strong>WhatsApp:</strong> ${data.whatsapp_status}`;
+                    resultBox.style.color = '#34d399';
+                    fetchCalls();
+                } else {
+                    resultBox.innerHTML = `❌ Error: ${data.error || 'Booking failed'}`;
+                    resultBox.style.color = '#f87171';
+                }
+            } catch(e) {
+                resultBox.innerHTML = `❌ Network Error: ${e.message}`;
+                resultBox.style.color = '#f87171';
+            }
+        }
+
         fetchStatus();
         fetchSlots();
+        fetchCalls();
     </script>
 </body>
 </html>
@@ -509,6 +626,39 @@ async def book_slot(request: Request):
         phone=data.get("phone"),
         notes=data.get("notes", ""),
     )
+    return result
+
+
+@app.post("/api/test/email")
+async def test_email_endpoint(request: Request):
+    """Test endpoint to trigger a sample booking confirmation email via Gmail / SMTP."""
+    data = await request.json()
+    email = data.get("email")
+    if not email:
+        return {"success": False, "error": "Email is required"}
+    name = data.get("name", "Test Patient")
+    start_time = data.get("start_time", "2026-10-18T10:00:00+05:30")
+    booking_id = data.get("booking_id", "TEST-BKG-001")
+    notes = data.get("notes", "General Consultation")
+    result = await send_booking_confirmation_email(
+        guest_name=name,
+        guest_email=email,
+        start_time=start_time,
+        booking_id=booking_id,
+        notes=notes,
+    )
+    return result
+
+
+@app.post("/api/test/whatsapp")
+async def test_whatsapp_endpoint(request: Request):
+    """Test endpoint to trigger a sample WhatsApp message (Meta Cloud API or simulated)."""
+    data = await request.json()
+    phone = data.get("phone")
+    if not phone:
+        return {"success": False, "error": "Phone number is required"}
+    message = data.get("message", "Test WhatsApp notification from Automated Voice Agent")
+    result = await send_direct_whatsapp_message(phone, message)
     return result
 
 

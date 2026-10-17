@@ -25,6 +25,7 @@ from pipecat.frames.frames import LLMMessagesAppendFrame
 
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.sarvam.stt import SarvamSTTService
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.openai.tts import OpenAITTSService
 from pipecat.services.llm_service import FunctionCallParams
@@ -56,28 +57,43 @@ def create_agent_pipeline(
     caller_name = profile.get("name", "")
     system_prompt = get_system_prompt(caller_name=caller_name, caller_phone=caller_phone)
 
-    # 2. VAD (Voice Activity Detection with tuned low-latency silence threshold)
+    # 2. VAD (Voice Activity Detection with tuned sensitivity to prevent accidental interruptions)
     vad = VADProcessor(
         vad_analyzer=SileroVADAnalyzer(
             params=VADParams(
-                start_secs=0.08,
-                stop_secs=0.25,
-                confidence=0.7,
+                start_secs=0.2,
+                stop_secs=0.4,
+                confidence=0.8,
             )
         )
     )
 
-    # 3. STT (Speech-to-Text: Deepgram)
+    # 3. STT (Speech-to-Text: Sarvam AI or Deepgram)
+    sarvam_key = os.getenv("SARVAM_API_KEY", "").strip().strip('"')
     deepgram_key = os.getenv("DEEPGRAM_API_KEY", "").strip().strip('"')
-    if not deepgram_key:
-        logger.warning("DEEPGRAM_API_KEY is not set. Please add it to your .env file.")
-    stt = DeepgramSTTService(
-        api_key=deepgram_key,
-        encoding="linear16",
-        sample_rate=16000,
-    )
 
-    # 4. LLM Service (OpenRouter or OpenAI)
+    if sarvam_key:
+        logger.info("Using Sarvam AI Speech-to-Text (Saaras)")
+        stt = SarvamSTTService(
+            api_key=sarvam_key,
+            sample_rate=16000,
+        )
+    elif deepgram_key:
+        logger.info("Using Deepgram STT")
+        stt = DeepgramSTTService(
+            api_key=deepgram_key,
+            encoding="linear16",
+            sample_rate=16000,
+        )
+    else:
+        logger.warning("Neither SARVAM_API_KEY nor DEEPGRAM_API_KEY is set in .env")
+        stt = DeepgramSTTService(
+            api_key="placeholder",
+            encoding="linear16",
+            sample_rate=16000,
+        )
+
+    # 4. LLM Service (OpenRouter, Sarvam AI, or OpenAI)
     openrouter_key = (os.getenv("OPEN_ROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY") or "").strip().strip('"')
     openai_key = (os.getenv("OPENAI_API_KEY") or "").strip().strip('"')
     llm_model = os.getenv("LLM_MODEL", "openai/gpt-4o-mini")
@@ -94,6 +110,21 @@ def create_agent_pipeline(
                 temperature=0.7,
             ),
         )
+    elif sarvam_key:
+        sarvam_model = os.getenv("LLM_MODEL", "sarvam-105b-conversations").strip()
+        if not sarvam_model or "gpt" in sarvam_model:
+            sarvam_model = "sarvam-105b-conversations"
+        logger.info(f"Using Sarvam AI Multilingual LLM ({sarvam_model})")
+        llm = OpenAILLMService(
+            api_key=sarvam_key,
+            base_url="https://api.sarvam.ai/v1",
+            settings=OpenAILLMService.Settings(
+                model=sarvam_model,
+                system_instruction=system_prompt,
+                max_tokens=150,
+                temperature=0.7,
+            ),
+        )
     elif openai_key:
         logger.info("Using native OpenAI gpt-4o-mini")
         llm = OpenAILLMService(
@@ -106,7 +137,7 @@ def create_agent_pipeline(
             ),
         )
     else:
-        logger.warning("Neither OPEN_ROUTER_API_KEY nor OPENAI_API_KEY is set in .env")
+        logger.warning("No LLM key is set in .env")
         llm = OpenAILLMService(
             api_key="sk-placeholder",
             settings=OpenAILLMService.Settings(
@@ -256,7 +287,7 @@ def create_agent_pipeline(
         voice_id = os.getenv("CARTESIA_VOICE_ID", "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc")
         tts = CartesiaTTSService(
             api_key=cartesia_key,
-            settings=CartesiaTTSService.Settings(voice=voice_id),
+            settings=CartesiaTTSService.Settings(voice=voice_id, model="sonic-2"),
             sample_rate=16000,
         )
     else:
